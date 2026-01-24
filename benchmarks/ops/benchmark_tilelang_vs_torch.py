@@ -4,8 +4,22 @@ Minimal benchmark: TileLang vs Torch (naive) at small sequence lengths
 import torch
 import triton
 
-from fla.ops.based.naive import naive_parallel_based
+from fla.ops.based.naive import naive_parallel_based, naive_chunk_based
+from fla.ops.based import parallel_based
 from benchmarks.ops.tilelang_based import tilelang_based
+
+# Compiled version of naive_parallel_based (compiled once at module load)
+naive_parallel_based_compiled = torch.compile(naive_parallel_based, mode="max-autotune")
+
+# Import the alternative TileLang implementation from the archive
+import sys
+import os
+import importlib.util
+sys.path.append('/home/simon/willyc/dsl-monkeys/runs/lv5-gemini-3-pro-preview-BIGRUNREAL/archive/kernels/level5')
+spec = importlib.util.spec_from_file_location("5_21_8", "/home/simon/willyc/dsl-monkeys/runs/lv5-gemini-3-pro-preview-BIGRUNREAL/archive/kernels/level5/5_21_8.py")
+module_5_21_8 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module_5_21_8)
+TileLangParallelNew = module_5_21_8.ModelNew
 
 # LOCAL H200 BENCHMARK ON RICHARD
 
@@ -56,47 +70,69 @@ _correctness_checked = set()
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['T'],
-        x_vals=[64 * 2 ** i for i in range(0, 8)],
+        x_vals=[64 * 2 ** i for i in range(2, 8)],
         line_arg='provider',
-        line_vals=['torch', 'tilelang'],
-        line_names=['torch_fwd', 'tilelang_fwd'],
-        styles=[('blue', '-'), ('magenta', '-')],
+        # line_vals=['torch', 'torch_compiled', 'parallel', 'tilelang', 'tilelang_parallel_new', 'chunk_based'],
+        # line_names=['torch_fwd', 'torch_compiled_fwd', 'parallel_fwd', 'tilelang_fwd', 'tilelang_parallel_new_fwd', 'chunk_based_fwd'],
+        line_vals=['torch', 'torch_compiled', 'parallel', 'parallel_chunk', 'tilelang', 'tilelang_parallel_new'],
+        line_names=['torch_fwd', 'torch_compiled_fwd', 'parallel_fwd', 'parallel_chunk_fwd', 'tilelang_fwd', 'tilelang_parallel_new_fwd'],
+        styles=[('blue', '-'), ('blue', '--'), ('green', '-'), ('green', '--'), ('magenta', '-'), ('magenta', '--')],
         ylabel="Execution Time (ms)",
         plot_name="TileLang_vs_Torch",
         args={},
     ),
 )
 def benchmark(T, provider):
+    """Matches benchmark_based.py input format exactly."""
     from fla.utils import device
     dtype = torch.bfloat16
     B, H, D = 8, 16, 128
     quantiles = [0.5, 0.2, 0.8]
+    results = 0, 0, 0
     
-    if provider == 'torch':
+    # Input tensor creation - matches benchmark_based.py exactly
+    if provider in ('torch', 'torch_compiled', 'parallel_chunk'):
+        # Head-first format (B, H, T, D) with feature_dim=16 for Q/K
         q = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        # Warmup runs
-        for _ in range(3):
-            naive_parallel_based(q, k, v)
-        torch.cuda.synchronize()
-        result = triton.testing.do_bench(lambda: naive_parallel_based(q, k, v), quantiles=quantiles)
-        
+    elif provider in ('parallel',):
+        # Seq-first format (B, T, H, D) with feature_dim=16 for Q/K
+        q = torch.randn(B, T, H, 16, device=device, requires_grad=False, dtype=dtype)
+        k = torch.randn(B, T, H, 16, device=device, requires_grad=False, dtype=dtype)
+        v = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
+    elif provider in ('tilelang', 'tilelang_parallel_new'):
+        # TileLang uses head-first format (B, H, T, D) with full D for all
+        q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+    
+    # Benchmark each provider
+    if provider == 'torch':
+        results = triton.testing.do_bench(lambda: naive_parallel_based(q, k, v), quantiles=quantiles)
         # Run correctness check after benchmarking this T value (only once per T)
         if T not in _correctness_checked:
             _correctness_checked.add(T)
             check_correctness(T=T)
-        
-        return result
-    elif provider == 'tilelang':
-        q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        # Warmup runs
+        return results
+    elif provider == 'torch_compiled':
+        # Warmup for torch.compile
         for _ in range(3):
-            tilelang_based(q, k, v)
+            naive_parallel_based_compiled(q, k, v)
         torch.cuda.synchronize()
+        return triton.testing.do_bench(lambda: naive_parallel_based_compiled(q, k, v), quantiles=quantiles)
+    elif provider == 'parallel':
+        return triton.testing.do_bench(lambda: parallel_based(q, k, v), quantiles=quantiles)
+    elif provider == 'parallel_chunk':
+        # naive_chunk_based requires T >= chunk_size (default 256)
+        if T < 256:
+            return results
+        return triton.testing.do_bench(lambda: naive_chunk_based(q, k, v), quantiles=quantiles)
+    elif provider == 'tilelang':
         return triton.testing.do_bench(lambda: tilelang_based(q, k, v), quantiles=quantiles)
+    elif provider == 'tilelang_parallel_new':
+        model = TileLangParallelNew()
+        return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
 
 
 if __name__ == '__main__':

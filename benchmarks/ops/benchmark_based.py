@@ -11,6 +11,12 @@ try:
 except Exception:
     HAS_FLASH = False
 
+try:
+    from benchmarks.ops.tilelang_based import tilelang_based
+    HAS_TILELANG = True
+except Exception:
+    HAS_TILELANG = False
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -21,15 +27,15 @@ except Exception:
         # argument name whose value corresponds to a different line in the plot
         line_arg='provider',
         line_vals=['fused_chunk', 'torch', 'parallel', 'parallel_chunk', 'fused_chunk_bwd', 'torch_bwd',
-                   'parallel_bwd', 'parallel_chunk_bwd'] + (['flash', 'flash_bwd'] if HAS_FLASH else []),
+                   'parallel_bwd', 'parallel_chunk_bwd'] + (['flash', 'flash_bwd'] if HAS_FLASH else []) + (['tilelang'] if HAS_TILELANG else []),
         # label name for the lines
         line_names=['fused_chunk_fwd', 'torch_fwd', 'parallel_fwd',  'parallel_chunk_fwd',
                     'fused_chunk_fwdbwd', 'torch_fwdbwd', 'parallel_fwdbwd',
-                    'parallel_chunk_fwdbwd'] + (['flash_fwd', 'flash_fwdbwd'] if HAS_FLASH else []),
+                    'parallel_chunk_fwdbwd'] + (['flash_fwd', 'flash_fwdbwd'] if HAS_FLASH else []) + (['tilelang_fwd'] if HAS_TILELANG else []),
 
         # line styles
         styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('green', 'dotted'), ('blue', 'dotted'),
-                ('red', 'dotted'), ('red', '--'), ('red', ':')] + ([('cyan', '-'), ('cyan', 'dotted')] if HAS_FLASH else []),
+                ('red', 'dotted'), ('red', '--'), ('red', ':')] + ([('cyan', '-'), ('cyan', 'dotted')] if HAS_FLASH else []) + ([('magenta', '-')] if HAS_TILELANG else []),
         ylabel="Execution Time (ms)",  # label name for the y-axis
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
@@ -81,6 +87,12 @@ def benchmark(T, provider):
         results = triton.testing.do_bench(lambda: flash_attn_func(q, k, v, causal=True).backward(do), quantiles=quantiles)
     elif provider == 'parallel_chunk_bwd':
         results = triton.testing.do_bench(lambda: naive_chunk_based(q, k, v).backward(do), quantiles=quantiles)
+    elif provider == 'tilelang':
+        # tilelang expects head-first format (B, H, T, D) with larger head dim
+        q_tl = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        k_tl = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        v_tl = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        results = triton.testing.do_bench(lambda: tilelang_based(q_tl, k_tl, v_tl), quantiles=quantiles)
     return results
 
 

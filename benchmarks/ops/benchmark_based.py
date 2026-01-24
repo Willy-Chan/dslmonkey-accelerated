@@ -97,4 +97,5 @@ def benchmark(T, provider):
 
 
 if __name__ == '__main__':
-    benchmark.run(print_data=True, show_plots=True)
+    # Run benchmark and save plots
+    benchmark.run(print_data=True, show_plots=True, save_path='./plots/')

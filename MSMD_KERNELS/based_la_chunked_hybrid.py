@@ -2,9 +2,9 @@
 Hybrid Chunked Based Linear Attention.
 
 Combines PyTorch for some operations with optimized TileLang kernels for:
-1. Normalizer computation (from 5_0_4.py)
-2. Inter-chunk linear term (from 5_3_5.py)  
-3. Final combine + normalize (from 5_5_2.py)
+1. Normalizer computation (5_0_4.py)
+2. Inter-chunk linear term (5_3_5.py)  
+3. Final combine + normalize (5_5_2.py)
 """
 
 import torch
@@ -42,13 +42,10 @@ def _build_normalizer_kernel(batch, heads, seq_len, dim, dtype="bfloat16"):
             row_sum_frag = T.alloc_fragment((BLOCK_M,), "float32")
             
             # Layout Hints
-
-            ## MANUAL INTERVENTION: DON'T SWIZZLE IF LARGE
-            if dim >= 64:
-                T.annotate_layout({
-                    Q_s: tilelang.layout.make_swizzled_layout(Q_s),
-                    K_s: tilelang.layout.make_swizzled_layout(K_s),
-                })
+            T.annotate_layout({
+                Q_s: tilelang.layout.make_swizzled_layout(Q_s),
+                K_s: tilelang.layout.make_swizzled_layout(K_s),
+            })
             
             # Initialize Accumulator
             T.clear(Acc_Z)
@@ -139,15 +136,13 @@ def _build_inter_chunk_kernel(batch, heads, n_chunks, chunk_size, dim, dtype="bf
             
             # Initialize State to 0
             T.clear(S_s)
-
-            # TODO: DONT SWIZZLE IF LARGE
-            if dim >= 64:
-                T.annotate_layout({
-                    S_s: tilelang.layout.make_swizzled_layout(S_s),
-                    Q_s: tilelang.layout.make_swizzled_layout(Q_s),
-                    K_s: tilelang.layout.make_swizzled_layout(K_s),
-                    V_s: tilelang.layout.make_swizzled_layout(V_s),
-                })
+            
+            T.annotate_layout({
+                S_s: tilelang.layout.make_swizzled_layout(S_s),
+                Q_s: tilelang.layout.make_swizzled_layout(Q_s),
+                K_s: tilelang.layout.make_swizzled_layout(K_s),
+                V_s: tilelang.layout.make_swizzled_layout(V_s),
+            })
 
             # Loop over chunks sequentially to maintain state dependency
             for c in T.serial(n_chunks):
@@ -224,61 +219,6 @@ def _build_combine_norm_kernel(total_rows, D, eps, dtype="bfloat16"):
     return tilelang.compile(kernel, out_idx=[5], target="cuda")
 
 
-class Model(nn.Module):
-    """
-    Naive Chunk-based Linear Attention (Based) - PyTorch reference.
-    """
-    def __init__(self, chunk_size: int = 256):
-        super(Model, self).__init__()
-        self.chunk_size = chunk_size
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        b, h, seq_len, d = q.shape
-        chunk_size = self.chunk_size
-        
-        # Scale queries
-        q = q * (d ** -0.5)
-        
-        # Compute normalizer
-        k_cumsum = torch.cumsum(k, dim=-2)
-        kk_cumsum = torch.cumsum(k.unsqueeze(-1) * k.unsqueeze(-2), dim=-3)
-        
-        z = (q * k_cumsum).sum(-1)
-        z = z + (q.unsqueeze(-1) * q.unsqueeze(-2) * kk_cumsum).sum((-1, -2)) * 0.5
-        z = z + (torch.arange(0, seq_len, device=z.device, dtype=z.dtype) + 1.0)[None, None, :]
-        
-        _o = v.cumsum(-2)
-        
-        n_chunks = seq_len // chunk_size
-        q = q.view(b, h, n_chunks, chunk_size, d)
-        k = k.view(b, h, n_chunks, chunk_size, d)
-        v = v.view(b, h, n_chunks, chunk_size, -1)
-        
-        intra_chunk_attn = q @ k.transpose(-2, -1)
-        intra_chunk_attn = intra_chunk_attn + 0.5 * (intra_chunk_attn ** 2)
-        
-        causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device))
-        intra_chunk_attn = intra_chunk_attn.masked_fill(~causal_mask, 0)
-        
-        o = intra_chunk_attn @ v
-        
-        kv_quad = torch.einsum('bhncd,bhnce,bhncf->bhndef', k, k, v)
-        kv_quad = kv_quad.cumsum(2)
-        kv_quad = torch.cat([torch.zeros_like(kv_quad[:, :, :1]), kv_quad[:, :, :-1]], dim=2)
-        o = o + 0.5 * torch.einsum('bhndef,bhncd,bhnce->bhncf', kv_quad, q, q)
-        
-        kv_lin = torch.einsum('bhncd,bhnce->bhnde', k, v)
-        kv_lin = kv_lin.cumsum(2)
-        kv_lin = torch.cat([torch.zeros_like(kv_lin[:, :, :1]), kv_lin[:, :, :-1]], dim=2)
-        o = o + torch.einsum('bhnde,bhncd->bhnce', kv_lin, q)
-        
-        o = o.view(b, h, seq_len, -1)
-        o = o + _o
-        o = o / (z[..., None] + 1e-6)
-        
-        return o
-
-
 class ModelNew(nn.Module):
     """
     Hybrid Chunked Based Linear Attention.
@@ -313,6 +253,7 @@ class ModelNew(nn.Module):
         chunk_size = self.chunk_size
         dtype_str = self._get_dtype_str(q)
         
+        # Ensure divisibility
         assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
         n_chunks = seq_len // chunk_size
         
@@ -320,58 +261,84 @@ class ModelNew(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
         
+        # =====================================================================
         # 1. Compute Normalizer using TileLang kernel
+        # =====================================================================
         norm_key = (b, h, seq_len, d, dtype_str)
         if norm_key not in self._normalizer_cache:
             self._normalizer_cache[norm_key] = _build_normalizer_kernel(b, h, seq_len, d, dtype_str)
         normalizer_kernel = self._normalizer_cache[norm_key]
+        
+        # Normalizer kernel expects unscaled Q (it scales internally)
         z = normalizer_kernel(q, k)  # [B, H, L]
         
+        # =====================================================================
         # 2. Compute Constant term (cumsum of V) - PyTorch
+        # =====================================================================
         constant_output = v.cumsum(dim=-2)  # [B, H, L, D]
         
-        # 3. Reshape into chunks
+        # =====================================================================
+        # 3. Reshape into chunks for chunk-wise operations
+        # =====================================================================
         q_chunks = q.view(b, h, n_chunks, chunk_size, d).contiguous()
         k_chunks = k.view(b, h, n_chunks, chunk_size, d).contiguous()
         v_chunks = v.view(b, h, n_chunks, chunk_size, d).contiguous()
         
+        # =====================================================================
         # 4. Intra-chunk attention - PyTorch
+        # =====================================================================
         scale = d ** -0.5
         q_scaled = q_chunks * scale
         
+        # S = Q @ K.T within each chunk
         intra_chunk_attn = q_scaled @ k_chunks.transpose(-2, -1)
+        # Polynomial: 1 + S + 0.5*S^2
         intra_chunk_attn = intra_chunk_attn + 0.5 * (intra_chunk_attn ** 2)
         
+        # Apply causal mask within chunk
         causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device))
         intra_chunk_attn = intra_chunk_attn.masked_fill(~causal_mask, 0)
         
-        intra_output = intra_chunk_attn @ v_chunks
+        # Intra output
+        intra_output = intra_chunk_attn @ v_chunks  # [B, H, N, C, D]
         intra_output = intra_output.view(b, h, seq_len, d)
         
+        # =====================================================================
         # 5. Inter-chunk quadratic term - PyTorch
+        # =====================================================================
+        # kv_quad = einsum('bhncd,bhnce,bhncf->bhndef', k, k, v)
         kv_quad = torch.einsum('bhncd,bhnce,bhncf->bhndef', k_chunks, k_chunks, v_chunks)
         kv_quad = kv_quad.cumsum(2)
+        # Shift by one chunk (previous chunks only)
         kv_quad = torch.cat([torch.zeros_like(kv_quad[:, :, :1]), kv_quad[:, :, :-1]], dim=2)
+        # Contract with q⊗q
         inter_quad_output = 0.5 * torch.einsum('bhndef,bhncd,bhnce->bhncf', kv_quad, q_scaled, q_scaled)
         inter_quad_output = inter_quad_output.view(b, h, seq_len, d)
         
+        # =====================================================================
         # 6. Inter-chunk linear term - TileLang kernel
+        # =====================================================================
         inter_key = (b, h, n_chunks, chunk_size, d, q.dtype)
         if inter_key not in self._inter_chunk_cache:
             self._inter_chunk_cache[inter_key] = _build_inter_chunk_kernel(
                 b, h, n_chunks, chunk_size, d, dtype=dtype_str
             )
         inter_kernel = self._inter_chunk_cache[inter_key]
-        inter_linear_output = inter_kernel(q_chunks, k_chunks, v_chunks)
+        
+        # Inter-chunk kernel expects unscaled Q (it scales internally)
+        inter_linear_output = inter_kernel(q_chunks, k_chunks, v_chunks)  # [B, H, N, C, D]
         inter_linear_output = inter_linear_output.view(b, h, seq_len, d)
         
+        # =====================================================================
         # 7. Combine and Normalize - TileLang kernel
+        # =====================================================================
         total_rows = b * h * seq_len
         combine_key = (total_rows, d, self.eps, dtype_str)
         if combine_key not in self._combine_cache:
             self._combine_cache[combine_key] = _build_combine_norm_kernel(total_rows, d, self.eps, dtype_str)
         combine_kernel = self._combine_cache[combine_key]
         
+        # Flatten inputs for combine kernel
         intra_flat = intra_output.view(total_rows, d).contiguous()
         inter_q_flat = inter_quad_output.view(total_rows, d).contiguous()
         inter_l_flat = inter_linear_output.view(total_rows, d).contiguous()

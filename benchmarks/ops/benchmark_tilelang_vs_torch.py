@@ -74,19 +74,32 @@ def check_correctness(T=512, atol=1e-2, rtol=1e-2):
 _correctness_checked = set()
 
 
-# PARALLEL (i.e. parallel_based) = hand optimized triton implementation
-# PARALLEL_CHUNK (i.e. naive_chunk_based) = pure pytorch with einsum - you would think "chunk" means it's better but it's pur pytorch lol
-# TILELANG  (i.e. tilelang_based) = TileLang implementation
-# TILELANG_PARALLEL_NEW (i.e. TileLangParallelNew) = TileLang implementation v2
+# PARALLEL = good for low sequence lengths, hand optimized triton. Simple and parallelizable, but memory heavy.
+#   - parallel_based is the hand optimized triton implementation
+#   - naive_parallel_based is the pure pytorch implementation
+#   * Our implementation is TILELANG_PARALLEL_NEW
+
+# CHUNKED = Process sequence in chunks. Mix between memory efficiency and parallelism (medium sequence length)
+#   - fused_chunk_based_fwd_kernel is the  hand optimized triton implementation
+#   - naive_chunk_based is the pure pytorch implementation
+
+# RECURRENT = token by token with a state, doesn't use tensor cores but totally linear you never materialize stuff
+#   - fused_recurrent_linear_attn is the hand optimized triton version
+#   * MISSING FOR BASED HERE
+
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['T'],
-        x_vals=[64 * 2 ** i for i in range(2, 8)],
+        x_vals=[64 * 2 ** i for i in range(2, 10)],
         line_arg='provider',
-        line_vals=['torch', 'torch_compiled', 'parallel', 'parallel_chunk', 'tilelang_parallel_new'],
-        line_names=['torch_fwd', 'torch_compiled_fwd', 'parallel_fwd', 'parallel_chunk_fwd', 'tilelang_parallel_new_fwd'],
+        # line_vals=['torch', 'torch_compiled', 'parallel', 'parallel_chunk', 'tilelang_parallel_new'],
+        # line_names=['torch_fwd', 'torch_compiled_fwd', 'parallel_fwd', 'parallel_chunk_fwd', 'tilelang_parallel_new_fwd'],
+
+        line_vals=['parallel', 'parallel_chunk', 'tilelang_parallel_new'],
+        line_names=['parallel_fwd', 'parallel_chunk_fwd', 'tilelang_parallel_new_fwd'],
+
         # line_vals=['torch_compiled', 'parallel', 'parallel_chunk', 'tilelang', 'tilelang_parallel_new'],
         # line_names=['torch_compiled_fwd', 'parallel_fwd', 'parallel_chunk_fwd', 'tilelang_fwd', 'tilelang_parallel_new_fwd'],
         styles=[('blue', '-'), ('blue', '--'), ('green', '-'), ('green', '--'), ('magenta', '-'), ('magenta', '--')],
@@ -119,6 +132,11 @@ def benchmark(T, provider):
         q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+    
+
+
+
+
     
     # Benchmark each provider
     if provider == 'torch':

@@ -19,6 +19,7 @@ dependencies = [
     "torch",
     "transformers",
     "einops",
+    "tilelang>=0.1.7.post3",
 ]
 
 [project.optional-dependencies]

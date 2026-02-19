@@ -113,16 +113,9 @@ def _build_retention_kernel(
                     
                     # Check causal mask
                     if row_global >= col_global:
-                        # Computation in float32
-                        diff = T.cast(row_global - col_global, "float32")
-                        decay_exponent = diff * s_val
-                        decay = T.exp2(decay_exponent)
-                        
-                        val_f32 = scores_shared[i, j]
-                        scaled_val = val_f32 * scale * decay
-                        
-                        # Store as float32
-                        p_shared[i, j] = scaled_val
+                        p_shared[i, j] = scores_shared[i, j] * scale * T.exp2(
+                            T.cast(row_global - col_global, "float32") * s_val
+                        )
                     else:
                         p_shared[i, j] = 0.0
 
@@ -149,14 +142,22 @@ class ModelNew(nn.Module):
         # Kernel cache
         object.__setattr__(self, '_kernel_cache', {})
 
-    def _get_kernel(self, batch_size, num_heads, seq_len, head_dim):
-        key = (batch_size, num_heads, seq_len, head_dim)
+    def _get_kernel(self, batch_size, num_heads, seq_len, head_dim, dtype: torch.dtype):
+        if dtype == torch.float16:
+            dtype_str = "float16"
+        elif dtype == torch.bfloat16:
+            dtype_str = "bfloat16"
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+
+        key = (batch_size, num_heads, seq_len, head_dim, dtype_str)
         if key not in self._kernel_cache:
             self._kernel_cache[key] = _build_retention_kernel(
                 batch_size=batch_size,
                 num_heads=num_heads,
                 seq_len=seq_len,
                 head_dim=head_dim,
+                dtype=dtype_str,
             )
         return self._kernel_cache[key]
 
@@ -167,7 +168,10 @@ class ModelNew(nn.Module):
         v: torch.Tensor
     ) -> torch.Tensor:
         orig_type = q.dtype
-        target_dtype = torch.bfloat16
+        if q.dtype in (torch.float16, torch.bfloat16):
+            target_dtype = q.dtype
+        else:
+            target_dtype = torch.bfloat16
         
         # Move to target dtype if necessary
         if q.dtype != target_dtype:
@@ -182,8 +186,8 @@ class ModelNew(nn.Module):
         v = v.contiguous()
 
         batch_size, num_heads, seq_len, head_dim = q.shape
-        
-        kernel = self._get_kernel(batch_size, num_heads, seq_len, head_dim)
+
+        kernel = self._get_kernel(batch_size, num_heads, seq_len, head_dim, target_dtype)
         
         # The kernel writes to a new tensor allocated by tilelang (out_idx=[3])
         out = kernel(q, k, v)

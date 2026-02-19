@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to split a PyTorch file into multiple KernelBench-formatted sections using Gemini-3-pro-preview.
-
-Usage:
-    python split_to_kernelbench.py <input_pytorch_file.py>
-
-Requires:
-    - GEMINI_API_KEY environment variable set
-    - google-genai package installed (pip install google-genai)
+Modified script to split PyTorch files into 2 KernelBench-formatted sections using Gemini-3-pro-preview.
 """
 
 import argparse
@@ -24,11 +17,25 @@ except ImportError:
     sys.exit(1)
 
 
-KERNELBENCH_OUTPUT_DIR = Path(__file__).parent.parent / "dsl-monkeys" / "KernelBench" / "KernelBench" / "level5"
+def build_prompt(source_code: str) -> str:
+    return f"""Please decompose the following PyTorch program into exactly 2 smaller KernelBench-formatted sections.
+
+Each section should represent a single kernel operation that could be independently optimized.
+
+SOURCE CODE:
+```python
+{source_code}
+```
+
+Output each section using the exact format specified, with each section starting with:
+# SECTION: <number>_<name>
+
+Make sure each section is a complete, self-contained Python file that can run independently."""
+
 
 SYSTEM_PROMPT = """You are an expert at decomposing PyTorch programs into smaller, self-contained kernel operations.
 
-Your task is to take a PyTorch program and split it into 4-5 smaller sections, where each section:
+Your task is to take a PyTorch program and split it into exactly 2 smaller sections, where each section:
 1. Represents a single, well-defined computational kernel
 2. Can be independently optimized/compiled
 3. Follows the KernelBench format exactly
@@ -75,28 +82,12 @@ CRITICAL REQUIREMENTS:
 2. Each section MUST be a complete, runnable Python file
 3. Each section MUST have the Model class with __init__ and forward methods
 4. Each section MUST have get_inputs() and get_init_inputs() functions
-5. Sections should be numbered 1 through 8 or 9
-6. Names should be descriptive snake_case (e.g., 1_chunked_intra_attn, 2_kv_state_update)
-7. Each kernel should do ONE logical operation (e.g., one matmul pattern, one reduction, one elementwise op)
-8. Preserve the mathematical correctness - the composition of all kernels should be equivalent to the original
+5. Sections should be numbered 1 and 2 only
+6. Names should be descriptive snake_case (e.g., 1_attention_computation, 2_output_processing)
+7. Each kernel should do ONE logical operation
+8. Preserve the mathematical correctness - the composition of both kernels should be equivalent to the original
 
-Think about how to decompose the program into fundamental operations that could each benefit from custom Triton kernels."""
-
-
-def build_prompt(source_code: str) -> str:
-    return f"""Please decompose the following PyTorch program into 8-9 smaller KernelBench-formatted sections.
-
-Each section should represent a single kernel operation that could be independently optimized.
-
-SOURCE CODE:
-```python
-{source_code}
-```
-
-Output each section using the exact format specified, with each section starting with:
-# SECTION: <number>_<name>
-
-Make sure each section is a complete, self-contained Python file that can run independently."""
+Think about how to decompose the program into exactly 2 fundamental operations that could each benefit from custom Triton kernels."""
 
 
 def extract_sections(response_text: str) -> list[tuple[str, str]]:
@@ -107,7 +98,6 @@ def extract_sections(response_text: str) -> list[tuple[str, str]]:
     sections = []
     
     # Pattern to match section headers and their code
-    # Look for # SECTION: followed by the name, then capture until next section or end
     pattern = r'# SECTION:\s*(\d+_[a-zA-Z0-9_]+)\s*\n(.*?)(?=# SECTION:|$)'
     
     # First try to find sections within code blocks
@@ -120,9 +110,6 @@ def extract_sections(response_text: str) -> list[tuple[str, str]]:
             section_match = re.match(r'# SECTION:\s*(\d+_[a-zA-Z0-9_]+)\s*\n', block)
             if section_match:
                 name = section_match.group(1)
-                # Remove the section header line from the code
-                code = block[section_match.end():].strip()
-                # But we want to keep imports, so actually keep everything after the header
                 code = re.sub(r'^# SECTION:.*\n', '', block).strip()
                 sections.append((name, code))
     else:
@@ -130,7 +117,6 @@ def extract_sections(response_text: str) -> list[tuple[str, str]]:
         matches = re.findall(pattern, response_text, re.DOTALL)
         for name, code in matches:
             code = code.strip()
-            # Remove markdown code block markers if present
             code = re.sub(r'^```python\s*\n?', '', code)
             code = re.sub(r'\n?```\s*$', '', code)
             sections.append((name.strip(), code.strip()))
@@ -155,13 +141,13 @@ def call_gemini(source_code: str, api_key: str) -> str:
     return response.text
 
 
-def write_sections(sections: list[tuple[str, str]], output_dir: Path, dry_run: bool = False):
+def write_sections(sections: list[tuple[str, str]], output_dir: Path, input_filename: str, dry_run: bool = False):
     """Write extracted sections to files."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
     written_files = []
     for name, code in sections:
-        filename = f"{name}.py"
+        filename = f"{input_filename}_{name}.py"
         filepath = output_dir / filename
         
         if dry_run:
@@ -177,14 +163,59 @@ def write_sections(sections: list[tuple[str, str]], output_dir: Path, dry_run: b
     return written_files
 
 
+def process_file(input_file: Path, output_dir: Path, api_key: str, dry_run: bool = False):
+    """Process a single file."""
+    print(f"\nProcessing: {input_file}")
+    
+    # Read input file
+    if not input_file.exists():
+        print(f"Error: Input file not found: {input_file}")
+        return False
+    
+    source_code = input_file.read_text()
+    print(f"Read {len(source_code)} bytes from {input_file}")
+    
+    # Call Gemini
+    print("Calling Gemini-3-pro-preview...")
+    try:
+        response_text = call_gemini(source_code, api_key)
+        print(f"Received response ({len(response_text)} chars)")
+    except Exception as e:
+        print(f"Error calling Gemini: {e}")
+        return False
+    
+    # Extract sections
+    sections = extract_sections(response_text)
+    print(f"Extracted {len(sections)} sections")
+    
+    if not sections:
+        print("Error: No sections extracted from response. Raw response:")
+        print(response_text[:2000])
+        return False
+    
+    # Write files
+    input_stem = input_file.stem
+    written = write_sections(sections, output_dir, input_stem, dry_run=dry_run)
+    
+    if not dry_run:
+        print(f"Successfully wrote {len(written)} files for {input_file.name}")
+    
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Split a PyTorch file into KernelBench-formatted sections using Gemini"
+        description="Split PyTorch files into 2 KernelBench-formatted sections using Gemini"
     )
-    parser.add_argument("input_file", type=Path, help="Input PyTorch .py file to split")
     parser.add_argument(
-        "--output-dir", "-o", type=Path, default=KERNELBENCH_OUTPUT_DIR,
-        help=f"Output directory for generated files (default: {KERNELBENCH_OUTPUT_DIR})"
+        "--input-dir", type=Path, 
+        default=Path("/home/simon/willyc/dsl-monkeys/KernelBench/KernelBench/level6"),
+        help="Input directory containing PyTorch .py files to split"
+    )
+    parser.add_argument(
+        "--output-dir", "-o", type=Path, 
+        default=Path("/home/simon/willyc/dsl-monkeys/KernelBench/KernelBench/level22"),
+        help="Output directory for generated files"
     )
     parser.add_argument(
         "--dry-run", "-n", action="store_true",
@@ -203,33 +234,42 @@ def main():
         print("Error: GEMINI_API_KEY environment variable not set and --api-key not provided")
         sys.exit(1)
     
-    # Read input file
-    if not args.input_file.exists():
-        print(f"Error: Input file not found: {args.input_file}")
+    # Find all .py files in input directory
+    if not args.input_dir.exists():
+        print(f"Error: Input directory not found: {args.input_dir}")
         sys.exit(1)
     
-    source_code = args.input_file.read_text()
-    print(f"Read {len(source_code)} bytes from {args.input_file}")
-    
-    # Call Gemini
-    print("Calling Gemini-3-pro-preview...")
-    response_text = call_gemini(source_code, api_key)
-    print(f"Received response ({len(response_text)} chars)")
-    
-    # Extract sections
-    sections = extract_sections(response_text)
-    print(f"Extracted {len(sections)} sections")
-    
-    if not sections:
-        print("Error: No sections extracted from response. Raw response:")
-        print(response_text[:2000])
+    py_files = list(args.input_dir.glob("*.py"))
+    if not py_files:
+        print(f"No .py files found in {args.input_dir}")
         sys.exit(1)
     
-    # Write files
-    written = write_sections(sections, args.output_dir, dry_run=args.dry_run)
+    print(f"Found {len(py_files)} .py files to process:")
+    for f in py_files:
+        print(f"  - {f.name}")
+    
+    # Process each file
+    successful = 0
+    failed = 0
+    
+    for py_file in py_files:
+        try:
+            if process_file(py_file, args.output_dir, api_key, dry_run=args.dry_run):
+                successful += 1
+            else:
+                failed += 1
+        except Exception as e:
+            print(f"Error processing {py_file.name}: {e}")
+            failed += 1
+    
+    print(f"\n{'='*60}")
+    print(f"Processing complete!")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"Output directory: {args.output_dir}")
     
     if not args.dry_run:
-        print(f"\nSuccessfully wrote {len(written)} files to {args.output_dir}")
+        print(f"Generated files are in: {args.output_dir}")
 
 
 if __name__ == "__main__":

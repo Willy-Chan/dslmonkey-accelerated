@@ -17,6 +17,7 @@ Produces two graphs:
 import torch
 import triton
 import matplotlib.pyplot as plt
+import argparse
 
 from fla.ops.based.naive import naive_parallel_based, naive_chunk_based
 from fla.ops.based import parallel_based, fused_chunk_based
@@ -27,26 +28,22 @@ naive_chunk_based_compiled = torch.compile(naive_chunk_based)
 # Import TileLang implementations
 import sys
 import importlib.util
-spec_rag3 = importlib.util.spec_from_file_location(
-    "based_parallel_rag3",
-    "/home/simon/willyc/dslmonkey-accelerated/BASED_SOLUTIONS/rag3_parallel_based.py",
+spec = importlib.util.spec_from_file_location(
+    "based_la_parallel", 
+    "/home/simon/willyc/dslmonkey-accelerated/MSMD_KERNELS/based_la_parallel.py"
 )
-module_rag3 = importlib.util.module_from_spec(spec_rag3)
-spec_rag3.loader.exec_module(module_rag3)
-TileLangParallelRag3 = module_rag3.ModelNew
-
-spec_repeated = importlib.util.spec_from_file_location(
-    "based_parallel_repeatedsampling",
-    "/home/simon/willyc/dsl-monkeys/runs/CASE_STUDY_RESULTS/LEVEL5-tilepilot-s157-k5-gemini-3-pro-preview-OFFICIAL-FORREALTHISTIME/archive/kernels/level5/5_40_1.py",
-)
-module_repeated = importlib.util.module_from_spec(spec_repeated)
-spec_repeated.loader.exec_module(module_repeated)
-TileLangParallelRepeatedSampling = module_repeated.ModelNew
+module_parallel = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module_parallel)
+TileLangParallelNew = module_parallel.ModelNew
 
 spec_chunked = importlib.util.spec_from_file_location(
     "based_la_chunked_v2", 
-    "/home/simon/willyc/dsl-monkeys/runs/CASE_STUDY_RESULTS/LEVEL5-tilepilot-s157-k5-gemini-3-pro-preview-OFFICIAL-FORREALTHISTIME/archive/kernels/level5/5_40_1.py"
+    "/home/simon/willyc/dslmonkey-accelerated/MSMD_KERNELS_2/based_la_chunked.py"
 )
+# spec_chunked = importlib.util.spec_from_file_location(
+#     "based_la_chunked_v2", 
+#     "/home/simon/willyc/dslmonkey-accelerated/MSMD_KERNELS_2/based_la_chunked_fused.py"
+# )
 module_chunked = importlib.util.module_from_spec(spec_chunked)
 spec_chunked.loader.exec_module(module_chunked)
 TileLangChunkedNew = module_chunked.ModelNew
@@ -58,17 +55,47 @@ _compiled_warmup_parallel = set()
 _compiled_warmup_chunked = set()
 
 
-FEATURE_DIM=64
+def _make_parallel_runner(provider: str, T: int):
+    from fla.utils import device
 
-def get_flops(batch, seqlen, headdim, nheads):
-    expanded_dim = FEATURE_DIM * FEATURE_DIM + FEATURE_DIM + 1
-    f = 2 * batch * seqlen * nheads * expanded_dim # compute feature map on q and k
-    f += batch * seqlen * nheads * headdim * expanded_dim # (k * v)
-    f += batch * seqlen * nheads * headdim * expanded_dim # (cumsum)
-    f += batch * seqlen * nheads * headdim * expanded_dim # (q * (k * v).cumsum)
-    f += batch * seqlen * nheads * headdim * expanded_dim # .sum(dim=-1)
-    return f
+    dtype = torch.float16
+    B, H, D = 8, 16, 128
 
+    if provider == 'parallel_triton':
+        q = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
+        k = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
+        v = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
+
+        def _run():
+            parallel_based(q, k, v)
+
+        return _run
+
+    if provider == 'tilelang_parallel':
+        q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
+        model = TileLangParallelNew()
+
+        def _run():
+            model(q, k, v)
+
+        return _run
+
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+def run_nsight_parallel(provider: str, T: int, warmup: int, iters: int):
+    run = _make_parallel_runner(provider=provider, T=T)
+    for _ in range(max(0, warmup)):
+        run()
+    torch.cuda.synchronize()
+
+    torch.cuda.nvtx.range_push(f"nsight_parallel::{provider}::T={T}::iters={iters}")
+    for _ in range(max(1, iters)):
+        run()
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
 
 
 def check_correctness_parallel(T=512, atol=1e-2, rtol=1e-2):
@@ -90,9 +117,8 @@ def check_correctness_parallel(T=512, atol=1e-2, rtol=1e-2):
     out_torch = naive_parallel_based(q, k, v)
     
     # TileLangParallelNew
-    model = TileLangParallelRag3()
+    model = TileLangParallelNew()
     out_tilelang = model(q, k, v)
-
     max_diff = (out_torch - out_tilelang).abs().max().item()
     mean_diff = (out_torch - out_tilelang).abs().mean().item()
     is_close = torch.allclose(out_torch, out_tilelang, atol=atol, rtol=rtol)
@@ -141,30 +167,12 @@ def check_correctness_chunked(T=512, atol=1e-2, rtol=1e-2):
     triton.testing.Benchmark(
         x_names=['T'],
         # 256, 512, 1k, 2k, 4k, 8k, 16k
-        x_vals=[256, 512, 1024, 2048, 4096, 8192],
-        # x_vals=[256],
+        # x_vals=[256, 512, 1024, 2048, 4096, 8192, 16384],
+        x_vals=[256, 512],
         line_arg='provider',
-        line_vals=[
-            'naive_torch',
-            'naive_torch_compiled',
-            'parallel_triton',
-            'tilelang_parallel_rag3',
-            'tilelang_parallel_repeatedsampling',
-        ],
-        line_names=[
-            'Naive PyTorch',
-            'Naive PyTorch (torch.compile)',
-            'Triton (parallel_based)',
-            'TileLang (rag3_parallel_based)',
-            'TileLang (repeatedsampling_parallel_based)',
-        ],
-        styles=[('red', '-'), ('orange', '-'), ('cyan', '-'), ('green', '-'), ('blue', '-')],
-
-        # line_vals=['naive_torch'],
-        # line_names=['Naive PyTorch'],
-        # styles=[('red', '-')],
-
-
+        line_vals=['naive_torch', 'naive_torch_compiled', 'parallel_triton', 'tilelang_parallel'],
+        line_names=['Naive PyTorch', 'Naive PyTorch (torch.compile)', 'Triton (parallel_based)', 'TileLang (ours)'],
+        styles=[('red', '-'), ('orange', '-'), ('cyan', '-'), ('green', '-')],
         xlabel='Sequence Length (T)',
         ylabel="Execution Time (ms)",
         plot_name="BASED Parallel Latency",
@@ -175,8 +183,7 @@ def benchmark_parallel(T, provider):
     """Benchmark parallel implementations at low-medium sequence lengths."""
     from fla.utils import device
     dtype = torch.float16
-    # B, H, D = 8, 16, 128
-    B, H, D = 16, 16, 64
+    B, H, D = 8, 16, 128
     quantiles = [0.5, 0.2, 0.8]
     results = (0, 0, 0)
     
@@ -188,9 +195,6 @@ def benchmark_parallel(T, provider):
         q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        # def get_flops(batch, seqlen, headdim, nheads):
-
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
         return triton.testing.do_bench(lambda: naive_parallel_based(q, k, v), quantiles=quantiles)
 
     if provider == 'naive_torch_compiled':
@@ -204,8 +208,6 @@ def benchmark_parallel(T, provider):
             for _ in range(3):
                 naive_parallel_based_compiled(q, k, v)
             torch.cuda.synchronize()
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         return triton.testing.do_bench(lambda: naive_parallel_based_compiled(q, k, v), quantiles=quantiles)
     
     elif provider == 'parallel_triton':
@@ -214,25 +216,15 @@ def benchmark_parallel(T, provider):
         q = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         return triton.testing.do_bench(lambda: parallel_based(q, k, v), quantiles=quantiles)
     
-    elif provider == 'tilelang_parallel_rag3':
+    elif provider == 'tilelang_parallel':
+        # TileLang uses (B, H, T, D) format - all dimensions must match
         q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-        model = TileLangParallelRag3()
+        model = TileLangParallelNew()
         return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
- 
-    # elif provider == 'tilelang_parallel_repeatedsampling':
-    #     q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-    #     k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-    #     v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-    #     print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-    #     model = TileLangParallelRepeatedSampling()
-    #     return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
     
     return results
 
@@ -261,11 +253,7 @@ def benchmark_chunked(T, provider):
     """Benchmark chunked implementations at long sequence lengths."""
     from fla.utils import device
     dtype = torch.float16
-    # B, H, D = 8, 16, 128
-
-    B, H, D = 8, 16, 64
-
-
+    B, H, D = 8, 16, 128
     quantiles = [0.5, 0.2, 0.8]
     results = (0, 0, 0)
     
@@ -274,8 +262,6 @@ def benchmark_chunked(T, provider):
         q = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         return triton.testing.do_bench(lambda: naive_chunk_based(q, k, v), quantiles=quantiles)
 
     if provider == 'naive_chunk_torch_compiled':
@@ -287,9 +273,6 @@ def benchmark_chunked(T, provider):
             for _ in range(3):
                 naive_chunk_based_compiled(q, k, v)
             torch.cuda.synchronize()
-        
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         return triton.testing.do_bench(lambda: naive_chunk_based_compiled(q, k, v), quantiles=quantiles)
     
     if provider == 'fused_chunk_triton':
@@ -297,8 +280,6 @@ def benchmark_chunked(T, provider):
         q = torch.randn(B, T, H, 16, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, T, H, 16, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, T, H, D, device=device, requires_grad=False, dtype=dtype)
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         return triton.testing.do_bench(lambda: fused_chunk_based(q, k, v), quantiles=quantiles)
     
     elif provider == 'tilelang_chunked':
@@ -306,45 +287,9 @@ def benchmark_chunked(T, provider):
         q = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         k = torch.randn(B, H, T, 16, device=device, requires_grad=False, dtype=dtype)
         v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-        print(f"{provider} TFLOP, T={T}: {get_flops(B, T, D, H)}")
-
         model = TileLangChunkedNew()
         return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
     
-    return results
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['T'],
-        x_vals=[256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
-        line_arg='provider',
-        line_vals=['tilelang_parallel_rag3', 'tilelang_parallel_repeatedsampling'],
-        line_names=['TileLang (rag3_parallel_based)', 'TileLang (repeatedsampling_parallel_based)'],
-        styles=[('green', '-'), ('blue', '-')],
-        xlabel='Sequence Length (T)',
-        ylabel="Execution Time (ms)",
-        plot_name="BASED Parallel TileLang Solutions Only",
-        args={},
-    ),
-)
-def benchmark_parallel_solutions(T, provider):
-    from fla.utils import device
-    dtype = torch.float16
-    B, H, D = 16, 16, 64
-    quantiles = [0.5, 0.2, 0.8]
-    results = (0, 0, 0)
- 
-    q = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-    k = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
-    v = torch.randn(B, H, T, D, device=device, requires_grad=False, dtype=dtype)
- 
-    # if provider == 'tilelang_parallel_rag3':
-    #     model = TileLangParallelRag3()
-    #     return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
-    # if provider == 'tilelang_parallel_repeatedsampling':
-    #     model = TileLangParallelRepeatedSampling()
-    #     return triton.testing.do_bench(lambda: model(q, k, v), quantiles=quantiles)
     return results
 
 
@@ -352,35 +297,43 @@ if __name__ == '__main__':
     import os
     save_path = './plots/'
     os.makedirs(save_path, exist_ok=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--nsight-provider', choices=['parallel_triton', 'tilelang_parallel', 'both'], default=None)
+    parser.add_argument('--T', type=int, default=2048)
+    parser.add_argument('--warmup', type=int, default=5)
+    parser.add_argument('--iters', type=int, default=200)
+    args = parser.parse_args()
+
+    if args.nsight_provider is not None:
+        providers = ['parallel_triton', 'tilelang_parallel'] if args.nsight_provider == 'both' else [args.nsight_provider]
+        for p in providers:
+            run_nsight_parallel(provider=p, T=args.T, warmup=args.warmup, iters=args.iters)
+        raise SystemExit(0)
     
     # Correctness checks for all sequence lengths
     print("=" * 60)
     print("CORRECTNESS CHECK - PARALLEL")
     print("=" * 60)
-    parallel_seq_lens = [4096]
+    parallel_seq_lens = [256, 512, 1024, 2048, 4096, 8192]
     for seq_len in parallel_seq_lens:
         check_correctness_parallel(T=seq_len)
     
     # print("\n" + "=" * 60)
     # print("CORRECTNESS CHECK - CHUNKED")
     # print("=" * 60)
-    # chunked_seq_lens = [512, 1024, 2048]
+    # chunked_seq_lens = [512, 1024, 2048]  # Smaller sizes for chunked correctness
     # for seq_len in chunked_seq_lens:
     #     check_correctness_chunked(T=seq_len)
     
-    print("\n" + "=" * 60)
-    print("PARALLEL BENCHMARK (low-medium sequence lengths)")
-    print("=" * 60)
-    benchmark_parallel.run(print_data=True, show_plots=True, save_path=save_path)
+    # print("\n" + "=" * 60)
+    # print("PARALLEL BENCHMARK (low-medium sequence lengths)")
+    # print("=" * 60)
+    # benchmark_parallel.run(print_data=True, show_plots=True, save_path=save_path)
     
     # print("\n" + "=" * 60)
     # print("CHUNKED BENCHMARK (long sequence lengths)")
     # print("=" * 60)
     # benchmark_chunked.run(print_data=True, show_plots=True, save_path=save_path)
-    
-    # print("\n" + "=" * 60)
-    # print("PARALLEL BENCHMARK (TileLang solutions only)")
-    # print("=" * 60)
-    # benchmark_parallel_solutions.run(print_data=True, show_plots=True, save_path=save_path)
     
     print(f"\nPlots saved to {save_path}")

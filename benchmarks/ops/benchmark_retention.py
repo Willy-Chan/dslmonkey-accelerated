@@ -3,7 +3,7 @@ import os
 
 import torch
 import triton
-from flash_attn import flash_attn_func
+# from flash_attn import flash_attn_func  # Commented out - not installed
 
 from fla.ops.retention import chunk_retention, parallel_retention
 
@@ -17,11 +17,11 @@ from fla.ops.retention import chunk_retention, parallel_retention
         # argument name whose value corresponds to a different line in the plot
         line_arg='provider',
         # possible values for `line_arg``
-        line_vals=['chunk', 'parallel', 'flash', 'chunk_bwd', 'parallel_bwd', 'flash_bwd'],
+        line_vals=['chunk', 'parallel', 'chunk_bwd', 'parallel_bwd'],
         # label name for the lines
-        line_names=['chunk_fwd', 'parallel_fwd', 'flash_fwd', 'chunk_fwdbwd', 'parallel_fwdbwd', 'flash_fwdbwd'],
+        line_names=['chunk_fwd', 'parallel_fwd', 'chunk_fwdbwd', 'parallel_fwdbwd'],
         # line styles
-        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('green', 'dotted'), ('blue', 'dotted'), ('red', 'dotted')],
+        styles=[('green', '-'), ('blue', '-'), ('green', 'dotted'), ('blue', 'dotted')],
         ylabel="Execution Time (ms)",  # label name for the y-axis
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
@@ -32,7 +32,7 @@ def benchmark(T, provider):
     from fla.utils import device
     dtype = torch.bfloat16
     requires_grad = True
-    B, H, D = 4, 8, 256
+    B, H, D = 4, 8, 64
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
     q = torch.randn(B, T, H, D, device=device, requires_grad=requires_grad, dtype=dtype)
@@ -46,14 +46,14 @@ def benchmark(T, provider):
         results = triton.testing.do_bench(lambda: chunk_retention(q, k, v), quantiles=quantiles)
     elif provider == 'parallel':
         results = triton.testing.do_bench(lambda: parallel_retention(q, k, v), quantiles=quantiles)
-    elif provider == 'flash':
-        results = triton.testing.do_bench(lambda: flash_attn_func(q, k, v, causal=True), quantiles=quantiles)
+    # elif provider == 'flash':
+    #     results = triton.testing.do_bench(lambda: flash_attn_func(q, k, v, causal=True), quantiles=quantiles)
     elif provider == 'chunk_bwd':
         results = triton.testing.do_bench(lambda: chunk_retention(q, k, v)[0].backward(do), quantiles=quantiles)
     elif provider == 'parallel_bwd':
         results = triton.testing.do_bench(lambda: parallel_retention(q, k, v)[0].backward(do), quantiles=quantiles)
-    elif provider == 'flash_bwd':
-        results = triton.testing.do_bench(lambda: flash_attn_func(q, k, v, causal=True).backward(do), quantiles=quantiles)
+    # elif provider == 'flash_bwd':
+    #     results = triton.testing.do_bench(lambda: flash_attn_func(q, k, v, causal=True).backward(do), quantiles=quantiles)
     return results
 
 

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2', "STAGE"],
+    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
@@ -281,7 +281,7 @@ def pre_process_fwd_bwd_kernel_stage2(
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
+    key=['H', 'K', 'V', 'BV'],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
